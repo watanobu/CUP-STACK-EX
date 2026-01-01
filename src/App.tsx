@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import * as THREE from "three";
 import { Cup, GameState, Lane } from "./types";
 
 const LANE_COUNT = 4;
@@ -19,16 +20,6 @@ const sizeColors: Record<number, string> = {
   5: "#a78bfa",
 };
 
-const sizeNames: Record<number, string> = {
-  1: "Rose",
-  2: "Sky",
-  3: "Emerald",
-  4: "Amber",
-  5: "Violet",
-};
-
-const widthForSize = (size: number) => `${52 + size * 12}%`;
-
 const sizeGradients: Record<number, [string, string]> = {
   1: ["#fb7185", "#f472b6"],
   2: ["#38bdf8", "#60a5fa"],
@@ -37,9 +28,311 @@ const sizeGradients: Record<number, [string, string]> = {
   5: ["#a78bfa", "#c084fc"],
 };
 
-const liquidGradient = (size: number) => {
-  const [from, to] = sizeGradients[size] ?? ["#94a3b8", "#cbd5e1"];
-  return `linear-gradient(135deg, ${from}, ${to})`;
+type CupDimensions = {
+  height: number;
+  radiusTop: number;
+  radiusBottom: number;
+};
+
+const cupDimensionsForSize = (size: number): CupDimensions => {
+  const base = 0.7 + size * 0.12;
+  return {
+    height: 1.18 + size * 0.16,
+    radiusTop: base + 0.08,
+    radiusBottom: base,
+  };
+};
+
+const numberTextureCache = new Map<string, THREE.Texture>();
+
+const createNumberSprite = (text: string, color: string): THREE.Mesh => {
+  if (numberTextureCache.has(text + color)) {
+    const cached = numberTextureCache.get(text + color) as THREE.Texture;
+    const mat = new THREE.MeshBasicMaterial({
+      map: cached,
+      transparent: true,
+      depthTest: false,
+      depthWrite: false,
+      toneMapped: false,
+      side: THREE.DoubleSide,
+    });
+    return new THREE.Mesh(new THREE.PlaneGeometry(1, 1), mat);
+  }
+  const size = 256;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if (ctx) {
+    ctx.clearRect(0, 0, size, size);
+    ctx.strokeStyle = "rgba(0,0,0,0.65)";
+    ctx.lineWidth = 10;
+    ctx.font = "900 156px 'Space Grotesk', 'Inter', sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.strokeText(text, size / 2, size / 2 + 4);
+    ctx.fillStyle = color;
+    ctx.fillText(text, size / 2, size / 2);
+  }
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.needsUpdate = true;
+  numberTextureCache.set(text + color, texture);
+  const mat = new THREE.MeshBasicMaterial({
+    map: texture,
+    transparent: true,
+    depthTest: false,
+    depthWrite: false,
+    toneMapped: false,
+    side: THREE.DoubleSide,
+  });
+  return new THREE.Mesh(new THREE.PlaneGeometry(1, 1), mat);
+};
+
+const disposeObject = (obj: THREE.Object3D) => {
+  obj.traverse((child) => {
+    if ((child as THREE.Mesh).geometry) {
+      (child as THREE.Mesh).geometry.dispose();
+    }
+    if ((child as THREE.Mesh).material) {
+      const material = (child as THREE.Mesh).material as THREE.Material;
+      material.dispose();
+    }
+  });
+};
+
+const CupLaneCanvas = ({
+  lane,
+  laneIndex,
+  isSelected,
+  isDanger,
+  onClick,
+}: {
+  lane: Lane;
+  laneIndex: number;
+  isSelected: boolean;
+  isDanger: boolean;
+  onClick: (laneIndex: number) => void;
+}) => {
+  const mountRef = useRef<HTMLDivElement | null>(null);
+  const sceneRef = useRef<THREE.Scene | null>(null);
+  const animationRef = useRef<number | null>(null);
+  const lastObjectsRef = useRef<THREE.Object3D[]>([]);
+
+  useEffect(() => {
+    const mount = mountRef.current;
+    if (!mount) return;
+
+    const renderer = new THREE.WebGLRenderer({
+      antialias: true,
+      alpha: true,
+      powerPreference: "high-performance",
+    });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(mount.clientWidth, mount.clientHeight);
+    renderer.toneMappingExposure = 1.1;
+    mount.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color("#0b1225");
+    sceneRef.current = scene;
+
+    const camera = new THREE.PerspectiveCamera(
+      26,
+      mount.clientWidth / mount.clientHeight,
+      0.1,
+      140
+    );
+    camera.position.set(0, 10.5, 15);
+    camera.lookAt(0, 3, 0);
+
+    const ambient = new THREE.AmbientLight("#e5ecff", 0.55);
+    scene.add(ambient);
+    const dir = new THREE.DirectionalLight("#ffffff", 0.8);
+    dir.position.set(4, 10, 6);
+    scene.add(dir);
+    const rim = new THREE.DirectionalLight("#7dd3fc", 0.35);
+    rim.position.set(-6, 6, -4);
+    scene.add(rim);
+
+    const grid = new THREE.GridHelper(16, 16, "#1e293b", "#1e293b");
+    grid.position.y = -0.01;
+    grid.material.opacity = 0.18;
+    (grid.material as THREE.Material).transparent = true;
+    scene.add(grid);
+
+    const resizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.target === mount) {
+          const { width, height } = entry.contentRect;
+          renderer.setSize(width, height);
+          camera.aspect = width / height;
+          camera.updateProjectionMatrix();
+        }
+      }
+    });
+    resizeObserver.observe(mount);
+
+    const animate = () => {
+      renderer.render(scene, camera);
+      animationRef.current = requestAnimationFrame(animate);
+    };
+    animate();
+
+    return () => {
+      if (animationRef.current) cancelAnimationFrame(animationRef.current);
+      resizeObserver.disconnect();
+      lastObjectsRef.current.forEach(disposeObject);
+      lastObjectsRef.current = [];
+      renderer.dispose();
+      mount.removeChild(renderer.domElement);
+    };
+  }, []);
+
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene) return;
+
+    lastObjectsRef.current.forEach((obj) => {
+      scene.remove(obj);
+      disposeObject(obj);
+    });
+    lastObjectsRef.current = [];
+
+    let yOffset = 0;
+    lane.forEach((cup) => {
+      const dims = cupDimensionsForSize(cup.size);
+      const wallThickness = 0.1;
+
+      const outerGeo = new THREE.CylinderGeometry(
+        dims.radiusTop,
+        dims.radiusBottom,
+        dims.height,
+        44,
+        1,
+        true
+      );
+      const outerMat = new THREE.MeshPhysicalMaterial({
+        color: new THREE.Color(sizeColors[cup.size] ?? "#94a3b8"),
+        roughness: 0.18,
+        metalness: 0.1,
+        emissive: new THREE.Color(sizeColors[cup.size] ?? "#94a3b8").multiplyScalar(0.05),
+        transparent: true,
+        opacity: 0.54,
+        transmission: 0.85,
+        thickness: 0.22,
+        side: THREE.DoubleSide,
+      });
+      const outerMesh = new THREE.Mesh(outerGeo, outerMat);
+
+      const innerGeo = new THREE.CylinderGeometry(
+        dims.radiusTop - wallThickness,
+        dims.radiusBottom - wallThickness,
+        dims.height * 0.82,
+        40,
+        1,
+        true
+      );
+      const innerMat = new THREE.MeshStandardMaterial({
+        color: new THREE.Color("#0a0f1f"),
+        roughness: 0.8,
+        metalness: 0.01,
+        side: THREE.BackSide,
+      });
+      const innerMesh = new THREE.Mesh(innerGeo, innerMat);
+      innerMesh.position.y = -dims.height * 0.18;
+
+      const rimGeo = new THREE.RingGeometry(
+        dims.radiusTop - 0.05,
+        dims.radiusTop + 0.05,
+        64
+      );
+      const rimMat = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(sizeColors[cup.size] ?? "#e2e8f0"),
+        emissive: new THREE.Color(sizeColors[cup.size] ?? "#e2e8f0"),
+        emissiveIntensity: 0.16,
+        roughness: 0.18,
+        metalness: 0.32,
+        side: THREE.DoubleSide,
+      });
+      const rimMesh = new THREE.Mesh(rimGeo, rimMat);
+      rimMesh.rotation.x = -Math.PI / 2;
+      rimMesh.position.y = dims.height / 2 + 0.001;
+
+      // 底面ディスクで透けを防止
+      const baseGeo = new THREE.CircleGeometry(
+        Math.max(0.001, dims.radiusBottom - wallThickness * 0.45),
+        44
+      );
+      const baseMat = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(sizeColors[cup.size] ?? "#94a3b8").offsetHSL(0, -0.06, -0.12),
+        roughness: 0.46,
+        metalness: 0.1,
+        side: THREE.DoubleSide,
+      });
+      const baseMesh = new THREE.Mesh(baseGeo, baseMat);
+      baseMesh.rotation.x = -Math.PI / 2;
+      baseMesh.position.y = -dims.height / 2;
+
+      const group = new THREE.Group();
+      group.add(outerMesh);
+      group.add(innerMesh);
+      group.add(rimMesh);
+      group.add(baseMesh);
+
+      const label = createNumberSprite(String(cup.size), "#ffffff");
+      const labelSize = Math.max(0.9, 0.55 + cup.size * 0.1);
+      label.scale.set(labelSize, labelSize, labelSize);
+      label.position.set(0, dims.height * 0.2, dims.radiusTop + 0.18);
+      label.renderOrder = 5;
+      group.add(label);
+
+      if (cup.linked) {
+        const lockGeo = new THREE.TorusGeometry(dims.radiusBottom * 0.95, 0.08, 12, 40);
+        const lockMat = new THREE.MeshStandardMaterial({
+          color: new THREE.Color("#f97316"),
+          emissive: new THREE.Color("#f97316"),
+          emissiveIntensity: 0.25,
+          roughness: 0.3,
+          metalness: 0.2,
+        });
+        const lockMesh = new THREE.Mesh(lockGeo, lockMat);
+        lockMesh.rotation.x = Math.PI / 2;
+        lockMesh.position.y = -dims.height / 2 + 0.16;
+        group.add(lockMesh);
+      }
+
+      const yPos = yOffset + dims.height / 2;
+      group.position.set(0, yPos, 0);
+      group.name = cup.id;
+
+      scene.add(group);
+      lastObjectsRef.current.push(group);
+
+      yOffset += dims.height * 0.6;
+    });
+  }, [lane]);
+
+  return (
+    <button
+      type="button"
+      onClick={() => onClick(laneIndex)}
+      className={`relative flex flex-col rounded-2xl border border-slate-700/60 px-3 pt-3 transition focus:outline-none lane-surface ${
+        isSelected ? "ring-4 ring-cyan-300/80" : "hover:ring-2 hover:ring-cyan-200/70"
+      }`}
+    >
+      <div className="flex items-center justify-between text-xs text-slate-300">
+        <span>Lane {laneIndex + 1}</span>
+        {isDanger ? (
+          <span className="lane-highlight font-semibold text-rose-300">▼ DROP</span>
+        ) : (
+          <span className="text-slate-500">safe</span>
+        )}
+      </div>
+      <div className="relative mt-2 h-[540px] overflow-hidden rounded-xl bg-gradient-to-b from-slate-900/80 to-slate-950/95">
+        <div ref={mountRef} className="h-full w-full" />
+      </div>
+    </button>
+  );
 };
 
 // Top cup is always included; walk downward while linked cups continue.
@@ -156,217 +449,7 @@ const applyDropToLanes = (
   };
 };
 
-const CupView = ({ cup, isActive }: { cup: Cup; isActive: boolean }) => {
-  const liquid = liquidGradient(cup.size);
-  const accent = sizeColors[cup.size] ?? "#94a3b8";
-  const width = widthForSize(cup.size);
-  const bodyGradientId = `cup-body-${cup.id}`;
-  const liquidId = `cup-liquid-${cup.id}`;
-  const clipId = `cup-clip-${cup.id}`;
-  const scale = 0.88 + cup.size * 0.07;
-  const height = 72 + cup.size * 10;
-
-  return (
-    <div
-      className="relative flex items-center justify-center"
-      style={{ width }}
-    >
-      <svg
-        viewBox="0 0 140 150"
-        className={`transition-transform duration-150 drop-shadow-xl ${
-          isActive ? "cup-active" : ""
-        }`}
-        style={{
-          filter: `drop-shadow(0 12px 24px ${accent}30)`,
-          height: `${height}px`,
-          transform: `scale(${scale})`,
-        }}
-      >
-        <defs>
-          <linearGradient id={bodyGradientId} x1="0%" y1="0%" x2="100%" y2="120%">
-            <stop offset="0%" stopColor={`${accent}`} stopOpacity="0.9" />
-            <stop offset="60%" stopColor={`${accent}`} stopOpacity="0.55" />
-            <stop offset="100%" stopColor={`${accent}`} stopOpacity="0.35" />
-          </linearGradient>
-          <linearGradient id={liquidId} x1="0%" y1="0%" x2="100%" y2="100%">
-            <stop offset="0%" stopColor="white" stopOpacity="0.12" />
-            <stop offset="100%" stopColor="white" stopOpacity="0" />
-          </linearGradient>
-          <clipPath id={clipId}>
-            <path d="M24 14 L116 14 L102 130 L38 130 Z" />
-          </clipPath>
-        </defs>
-
-        <g transform="translate(0,4)">
-          <path
-            d="M20 6 L120 6 L104 134 Q70 144 36 134 Z"
-            fill="#0b1225"
-            stroke={`${accent}50`}
-            strokeWidth="3"
-          />
-          <path
-            d="M24 10 L116 10 L102 128 L38 128 Z"
-            fill={`url(#${bodyGradientId})`}
-            stroke="rgba(255,255,255,0.18)"
-            strokeWidth="1.5"
-          />
-          <ellipse
-            cx="70"
-            cy="12"
-            rx="52"
-            ry="12"
-            fill="rgba(255,255,255,0.42)"
-            stroke="rgba(0,0,0,0.35)"
-            strokeWidth="2"
-          />
-          <ellipse
-            cx="70"
-            cy="16"
-            rx="44"
-            ry="9"
-            fill="rgba(10, 12, 26, 0.92)"
-            stroke="rgba(255,255,255,0.12)"
-            strokeWidth="1"
-          />
-        </g>
-        <rect
-          x="28"
-          y="58"
-          width="84"
-          height="74"
-          fill={liquid}
-          clipPath={`url(#${clipId})`}
-          stroke={`${accent}55`}
-          strokeWidth="1.2"
-        />
-        <rect
-          x="28"
-          y="58"
-          width="84"
-          height="74"
-          fill={`url(#${liquidId})`}
-          clipPath={`url(#${clipId})`}
-        />
-        <ellipse cx="70" cy="142" rx="26" ry="9" fill="rgba(0,0,0,0.55)" />
-        <ellipse
-          cx="70"
-          cy="137"
-          rx="30"
-          ry="7.5"
-          fill="rgba(255,255,255,0.16)"
-          stroke="rgba(0,0,0,0.35)"
-          strokeWidth="2"
-        />
-        <text
-          x="20"
-          y="38"
-          fill="#e2e8f0"
-          fontSize="12"
-          fontWeight="700"
-          letterSpacing="0.12em"
-        >
-          {sizeNames[cup.size].toUpperCase()}
-        </text>
-        <text
-          x="20"
-          y="56"
-          fill="#e2e8f0"
-          fontSize="11"
-          fontWeight="600"
-          opacity="0.7"
-        >
-          SIZE {cup.size}
-        </text>
-        {cup.linked ? (
-          <g transform="translate(92,34)">
-            <rect
-              x="0"
-              y="-12"
-              width="42"
-              height="20"
-              rx="10"
-              fill="rgba(255,255,255,0.15)"
-              stroke="#f97316"
-              strokeWidth="1.6"
-            />
-            <text
-              x="10"
-              y="2"
-              fill="#f97316"
-              fontSize="11"
-              fontWeight="800"
-            >
-              LOCK
-            </text>
-          </g>
-        ) : null}
-      </svg>
-    </div>
-  );
-};
-
-const LaneColumn = ({
-  lane,
-  index,
-  nextDropLane,
-  selectedLane,
-  onClick,
-}: {
-  lane: Lane;
-  index: number;
-  nextDropLane: number;
-  selectedLane: number | null;
-  onClick: (laneIndex: number) => void;
-}) => {
-  const isDanger = nextDropLane === index;
-  const isSelected = selectedLane === index;
-  const movingStart = isSelected ? getMovingGroupStartIndex(lane) : -1;
-
-  return (
-    <button
-      type="button"
-      onClick={() => onClick(index)}
-      className={`relative flex flex-col rounded-2xl border border-slate-700/60 px-3 pt-3 transition focus:outline-none lane-surface ${
-        isSelected ? "ring-4 ring-cyan-300/80" : "hover:ring-2 hover:ring-cyan-200/70"
-      }`}
-    >
-      <div className="flex items-center justify-between text-xs text-slate-300">
-        <span>Lane {index + 1}</span>
-        {isDanger ? (
-          <span className="lane-highlight font-semibold text-rose-300">
-            ▼ DROP
-          </span>
-        ) : (
-          <span className="text-slate-500">safe</span>
-        )}
-      </div>
-      <div className="mt-2 flex h-[520px] flex-col-reverse items-center gap-0">
-        {lane.map((cup, cupIndex) => {
-          const isActive = isSelected && cupIndex >= movingStart;
-          const overlap = cupIndex === 0 ? 0 : -26;
-          return (
-            <div
-              key={cup.id}
-              style={{ marginTop: overlap }}
-              className="flex w-full justify-center"
-            >
-              <CupView cup={cup} isActive={!!isActive} />
-            </div>
-          );
-        })}
-        {Array.from({
-          length: Math.max(0, MAX_STACK_HEIGHT - lane.length),
-        }).map((_, i) => (
-          <div
-            key={`ghost-${index}-${i}`}
-            className="h-20 w-full rounded-lg border border-dashed border-slate-700/60 bg-slate-900/20"
-          />
-        ))}
-        <div className="pointer-events-none lane-grid absolute inset-2 rounded-xl" />
-      </div>
-    </button>
-  );
-};
+// Deprecated 2D cup view removed; replaced by Three.js canvas (CupLaneCanvas).
 
 const App = () => {
   const [lanes, setLanes] = useState<Lane[]>(
@@ -605,12 +688,12 @@ const App = () => {
 
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
             {lanes.map((lane, idx) => (
-              <LaneColumn
+              <CupLaneCanvas
                 key={`lane-${idx}`}
                 lane={lane}
-                index={idx}
-                nextDropLane={nextDropLane}
-                selectedLane={selectedLane}
+                laneIndex={idx}
+                isDanger={nextDropLane === idx}
+                isSelected={selectedLane === idx}
                 onClick={handleLaneClick}
               />
             ))}
