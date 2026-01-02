@@ -5,11 +5,28 @@ import { Cup, GameState, Lane } from "./types";
 const LANE_COUNT = 4;
 const MAX_STACK_HEIGHT = 6;
 const DROP_DELAY_MS = 500;
+const DROP_ANIM_HEIGHT = 24;
+const DROP_ANIM_DURATION_MS = 1100;
 
 type DropResult = {
   lanes: Lane[];
   lost: boolean;
   message: string;
+  spawnedId?: string;
+  spawnedVisualSize?: number;
+};
+
+const detectForcedLoss = (lanes: Lane[], nextLane: number): string | null => {
+  const lane = lanes[nextLane];
+  if (!lane) return null;
+  if (lane.length >= MAX_STACK_HEIGHT) {
+    return `次の落下先レーン${nextLane + 1}は高さ${MAX_STACK_HEIGHT}で受け皿なし。落下前に敗北します。`;
+  }
+  const top = lane[lane.length - 1];
+  if (top && top.linked && top.size === 1) {
+    return `次の落下先レーン${nextLane + 1}はロックされた1がトップです。1を落とせません。`;
+  }
+  return null;
 };
 
 const sizeColors: Record<number, string> = {
@@ -105,18 +122,55 @@ const CupLaneCanvas = ({
   laneIndex,
   isSelected,
   isDanger,
+  dropAnimatingCupId,
+  dropAnimatingLane,
+  dropAnimatingVisualSize,
   onClick,
+  onDropAnimEnd,
 }: {
   lane: Lane;
   laneIndex: number;
   isSelected: boolean;
   isDanger: boolean;
+  dropAnimatingCupId: string | null;
+  dropAnimatingLane: number | null;
+  dropAnimatingVisualSize: number | null;
   onClick: (laneIndex: number) => void;
+  onDropAnimEnd: () => void;
 }) => {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
   const animationRef = useRef<number | null>(null);
   const lastObjectsRef = useRef<THREE.Object3D[]>([]);
+  const cupGroupMapRef = useRef<Map<string, THREE.Group>>(new Map());
+  const targetYMapRef = useRef<Map<string, number>>(new Map());
+  const dropFrameRef = useRef<number | null>(null);
+
+  const startDropAnimation = (
+    group: THREE.Group,
+    baseY: number,
+    onEnd?: () => void
+  ) => {
+    if (dropFrameRef.current) cancelAnimationFrame(dropFrameRef.current);
+    const startY = baseY + DROP_ANIM_HEIGHT;
+    group.position.y = startY;
+    const start = performance.now();
+    const duration = DROP_ANIM_DURATION_MS;
+
+    const step = (now: number) => {
+      const t = Math.min(1, (now - start) / duration);
+      const eased = 1 - Math.pow(1 - t, 3);
+      group.position.y = startY + (baseY - startY) * eased;
+      if (t < 1) {
+        dropFrameRef.current = requestAnimationFrame(step);
+      } else {
+        group.position.y = baseY;
+        dropFrameRef.current = null;
+        if (onEnd) onEnd();
+      }
+    };
+    dropFrameRef.current = requestAnimationFrame(step);
+  };
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -180,9 +234,12 @@ const CupLaneCanvas = ({
 
     return () => {
       if (animationRef.current) cancelAnimationFrame(animationRef.current);
+      if (dropFrameRef.current) cancelAnimationFrame(dropFrameRef.current);
       resizeObserver.disconnect();
       lastObjectsRef.current.forEach(disposeObject);
       lastObjectsRef.current = [];
+      targetYMapRef.current.clear();
+      cupGroupMapRef.current.clear();
       renderer.dispose();
       mount.removeChild(renderer.domElement);
     };
@@ -198,10 +255,14 @@ const CupLaneCanvas = ({
     });
     lastObjectsRef.current = [];
 
+    cupGroupMapRef.current.clear();
+    targetYMapRef.current.clear();
     let yOffset = 0;
+
     lane.forEach((cup) => {
       const dims = cupDimensionsForSize(cup.size);
       const wallThickness = 0.1;
+      const colorHex = sizeColors[cup.size] ?? "#94a3b8";
 
       const outerGeo = new THREE.CylinderGeometry(
         dims.radiusTop,
@@ -212,10 +273,10 @@ const CupLaneCanvas = ({
         true
       );
       const outerMat = new THREE.MeshPhysicalMaterial({
-        color: new THREE.Color(sizeColors[cup.size] ?? "#94a3b8"),
+        color: new THREE.Color(colorHex),
         roughness: 0.18,
         metalness: 0.1,
-        emissive: new THREE.Color(sizeColors[cup.size] ?? "#94a3b8").multiplyScalar(0.05),
+        emissive: new THREE.Color(colorHex).multiplyScalar(0.05),
         transparent: true,
         opacity: 0.54,
         transmission: 0.85,
@@ -247,8 +308,8 @@ const CupLaneCanvas = ({
         64
       );
       const rimMat = new THREE.MeshStandardMaterial({
-        color: new THREE.Color(sizeColors[cup.size] ?? "#e2e8f0"),
-        emissive: new THREE.Color(sizeColors[cup.size] ?? "#e2e8f0"),
+        color: new THREE.Color(colorHex),
+        emissive: new THREE.Color(colorHex),
         emissiveIntensity: 0.16,
         roughness: 0.18,
         metalness: 0.32,
@@ -264,7 +325,7 @@ const CupLaneCanvas = ({
         44
       );
       const baseMat = new THREE.MeshStandardMaterial({
-        color: new THREE.Color(sizeColors[cup.size] ?? "#94a3b8").offsetHSL(0, -0.06, -0.12),
+        color: new THREE.Color(colorHex).offsetHSL(0, -0.06, -0.12),
         roughness: 0.46,
         metalness: 0.1,
         side: THREE.DoubleSide,
@@ -278,6 +339,7 @@ const CupLaneCanvas = ({
       group.add(innerMesh);
       group.add(rimMesh);
       group.add(baseMesh);
+      cupGroupMapRef.current.set(cup.id, group);
 
       const label = createNumberSprite(String(cup.size), "#ffffff");
       const labelSize = Math.max(0.9, 0.55 + cup.size * 0.1);
@@ -305,12 +367,84 @@ const CupLaneCanvas = ({
       group.position.set(0, yPos, 0);
       group.name = cup.id;
 
+      const shouldAnimate =
+        dropAnimatingCupId &&
+        dropAnimatingLane === laneIndex &&
+        cup.id === dropAnimatingCupId;
+
+      targetYMapRef.current.set(cup.id, yPos);
       scene.add(group);
       lastObjectsRef.current.push(group);
 
+      if (shouldAnimate) {
+        if (dropAnimatingVisualSize) {
+          // actual cup stays; spawn falling ghost of the visual size
+          const ghostDims = cupDimensionsForSize(dropAnimatingVisualSize);
+          const ghostColor = sizeColors[dropAnimatingVisualSize] ?? "#94a3b8";
+          const ghostGeo = new THREE.CylinderGeometry(
+            ghostDims.radiusTop,
+            ghostDims.radiusBottom,
+            ghostDims.height,
+            32,
+            1,
+            true
+          );
+          const ghostMat = new THREE.MeshPhysicalMaterial({
+            color: new THREE.Color(ghostColor),
+            roughness: 0.18,
+            metalness: 0.1,
+            transparent: true,
+            opacity: 0.68,
+            transmission: 0.72,
+            thickness: 0.22,
+            side: THREE.DoubleSide,
+          });
+          const ghost = new THREE.Mesh(ghostGeo, ghostMat);
+          const labelGhost = createNumberSprite(
+            String(dropAnimatingVisualSize),
+            "#ffffff"
+          );
+          labelGhost.scale.set(
+            Math.max(0.9, 0.55 + dropAnimatingVisualSize * 0.1),
+            Math.max(0.9, 0.55 + dropAnimatingVisualSize * 0.1),
+            Math.max(0.9, 0.55 + dropAnimatingVisualSize * 0.1)
+          );
+          labelGhost.position.set(
+            0,
+            ghostDims.height * 0.2,
+            ghostDims.radiusTop + 0.18
+          );
+          ghost.add(labelGhost);
+
+          ghost.position.set(0, yPos + DROP_ANIM_HEIGHT + ghostDims.height / 2, 0);
+          scene.add(ghost);
+          const start = performance.now();
+          const duration = DROP_ANIM_DURATION_MS;
+          const startY = ghost.position.y;
+          const targetY = yPos + ghostDims.height / 2;
+
+          const animateGhost = (now: number) => {
+            const t = Math.min(1, (now - start) / duration);
+            const eased = 1 - Math.pow(1 - t, 3);
+            ghost.position.y = startY + (targetY - startY) * eased;
+            if (t < 1) {
+              requestAnimationFrame(animateGhost);
+            } else {
+              ghost.position.y = targetY;
+              scene.remove(ghost);
+              disposeObject(ghost);
+              onDropAnimEnd();
+            }
+          };
+          requestAnimationFrame(animateGhost);
+        } else {
+          startDropAnimation(group, yPos, onDropAnimEnd);
+        }
+      }
+
       yOffset += dims.height * 0.6;
     });
-  }, [lane]);
+  }, [lane, dropAnimatingCupId, dropAnimatingLane, dropAnimatingVisualSize, laneIndex, onDropAnimEnd]);
 
   return (
     <button
@@ -396,10 +530,12 @@ const applyDropToLanes = (
   const dropTop = lane[lane.length - 1];
 
   if (!dropTop) {
-    lane.push({ id: createId(), size: 1, linked: false });
+    const newId = createId();
+    lane.push({ id: newId, size: 1, linked: false });
     return {
       lanes: updated,
       lost: false,
+      spawnedId: newId,
       message: `レーン${laneIndex + 1}に1が落下。`,
     };
   }
@@ -413,20 +549,23 @@ const applyDropToLanes = (
       };
     }
     const shouldLink = dropTop.size === 2;
-    lane.push({ id: createId(), size: 1, linked: shouldLink });
-    const overHeight = lane.length > MAX_STACK_HEIGHT;
-    return {
-      lanes: updated,
-      lost: overHeight,
-      message: `レーン${laneIndex + 1}に1が中に入りました。`,
-    };
-  }
+      const newId = createId();
+      lane.push({ id: newId, size: 1, linked: shouldLink });
+      const overHeight = lane.length > MAX_STACK_HEIGHT;
+      return {
+        lanes: updated,
+        lost: overHeight,
+        spawnedId: newId,
+        message: `レーン${laneIndex + 1}に1が中に入りました。`,
+      };
+    }
 
   if (dropTop.size === 1) {
     lane.pop();
     const below = lane[lane.length - 1];
+    const newId = createId();
     const newCup: Cup = {
-      id: createId(),
+      id: newId,
       size: 2,
       linked: below ? below.size - 2 === 1 : false,
     };
@@ -435,19 +574,23 @@ const applyDropToLanes = (
     return {
       lanes: updated,
       lost: overHeight,
+      spawnedId: newId,
+      spawnedVisualSize: 1,
       message: `レーン${laneIndex + 1}で1と1が合体し2になりました。`,
     };
   }
 
   const shouldLink = dropTop.size === 2;
-  lane.push({ id: createId(), size: 1, linked: shouldLink });
-  const overHeight = lane.length > MAX_STACK_HEIGHT;
-  return {
-    lanes: updated,
-    lost: overHeight,
-    message: `レーン${laneIndex + 1}に1が中に入りました。`,
+    lane.push({ id: createId(), size: 1, linked: shouldLink });
+    const newId = lane[lane.length - 1].id;
+    const overHeight = lane.length > MAX_STACK_HEIGHT;
+    return {
+      lanes: updated,
+      lost: overHeight,
+      spawnedId: newId,
+      message: `レーン${laneIndex + 1}に1が中に入りました。`,
+    };
   };
-};
 
 // Deprecated 2D cup view removed; replaced by Three.js canvas (CupLaneCanvas).
 
@@ -461,6 +604,15 @@ const App = () => {
   const [isDropping, setIsDropping] = useState(false);
   const [turn, setTurn] = useState(1);
   const [message, setMessage] = useState("タップして開始");
+  const [dropAnimatingCupId, setDropAnimatingCupId] = useState<string | null>(
+    null
+  );
+  const [dropAnimatingLane, setDropAnimatingLane] = useState<number | null>(
+    null
+  );
+  const [dropAnimatingVisualSize, setDropAnimatingVisualSize] = useState<
+    number | null
+  >(null);
 
   const idRef = useRef(1);
 
@@ -473,6 +625,17 @@ const App = () => {
   useEffect(() => {
     initGame();
   }, []);
+
+  useEffect(() => {
+    if (gameState !== "playing") return;
+    const forced = detectForcedLoss(lanes, nextDropLane);
+    if (forced) {
+      setGameState("lost");
+      setMessage(forced);
+      setIsDropping(false);
+      setSelectedLane(null);
+    }
+  }, [lanes, nextDropLane, gameState]);
 
   const initGame = () => {
     const empty = Array.from({ length: LANE_COUNT }, () => [] as Cup[]);
@@ -492,6 +655,9 @@ const App = () => {
     setIsDropping(false);
     setTurn(1);
     setMessage("ゲーム開始！移動元を選んでください。");
+    setDropAnimatingCupId(null);
+    setDropAnimatingLane(null);
+    setDropAnimatingVisualSize(null);
   };
 
   const handleLaneClick = (index: number) => {
@@ -610,13 +776,18 @@ const App = () => {
   const proceedToDrop = () => {
     setIsDropping(true);
     setTimeout(() => {
+      let lastDrop: DropResult | null = null;
       setLanes((current) => {
         const dropResult = applyDropToLanes(current, nextDropLane, nextId);
+        lastDrop = dropResult;
         const updated = dropResult.lanes;
 
         if (dropResult.lost) {
           setGameState("lost");
           setMessage(dropResult.message);
+          setDropAnimatingCupId(null);
+          setDropAnimatingLane(null);
+          setDropAnimatingVisualSize(null);
           setIsDropping(false);
           return updated;
         }
@@ -624,6 +795,9 @@ const App = () => {
         if (checkWin(updated)) {
           setGameState("won");
           setMessage("勝利！5-4-3-2-1が揃いました。");
+          setDropAnimatingCupId(null);
+          setDropAnimatingLane(null);
+          setDropAnimatingVisualSize(null);
           setIsDropping(false);
           return updated;
         }
@@ -633,9 +807,21 @@ const App = () => {
         setNextDropLane(upcoming);
         setTurn((t) => t + 1);
         setMessage(dropResult.message);
+        setDropAnimatingCupId(dropResult.spawnedId ?? null);
+        setDropAnimatingLane(dropResult.spawnedId ? nextDropLane : null);
+        setDropAnimatingVisualSize(
+          dropResult.spawnedId ? dropResult.spawnedVisualSize ?? null : null
+        );
         setIsDropping(false);
         return updated;
       });
+
+      if (lastDrop?.spawnedId && !lastDrop.spawnedVisualSize) {
+        // no ghost animation needed; clear immediately
+        setDropAnimatingVisualSize(null);
+        setDropAnimatingCupId(null);
+        setDropAnimatingLane(null);
+      }
     }, DROP_DELAY_MS);
   };
 
@@ -694,7 +880,15 @@ const App = () => {
                 laneIndex={idx}
                 isDanger={nextDropLane === idx}
                 isSelected={selectedLane === idx}
+                dropAnimatingCupId={dropAnimatingCupId}
+                dropAnimatingLane={dropAnimatingLane}
+                dropAnimatingVisualSize={dropAnimatingVisualSize}
                 onClick={handleLaneClick}
+                onDropAnimEnd={() => {
+                  setDropAnimatingVisualSize(null);
+                  setDropAnimatingCupId(null);
+                  setDropAnimatingLane(null);
+                }}
               />
             ))}
           </div>
@@ -709,6 +903,23 @@ const App = () => {
           ) : null}
         </section>
       </div>
+      {gameState === "lost" ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
+          <div className="max-w-md rounded-2xl border border-rose-400/50 bg-slate-900/95 px-8 py-10 text-center shadow-2xl">
+            <p className="text-sm uppercase tracking-[0.25em] text-rose-200">Game Over</p>
+            <p className="mt-3 text-xl font-semibold text-rose-100">
+              {message || "次の落下ができません。"}
+            </p>
+            <button
+              type="button"
+              onClick={initGame}
+              className="mt-6 inline-flex items-center justify-center rounded-full bg-rose-400 px-5 py-2 text-sm font-semibold text-slate-900 shadow-lg transition hover:bg-rose-300"
+            >
+              リセット
+            </button>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 };
