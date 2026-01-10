@@ -9,6 +9,9 @@ npm run dev   # http://localhost:5173/
 npm run build # 本番ビルド
 ```
 
+## デプロイ
+- Cloudflare Pages: https://cup-stack-ex.pages.dev/
+
 ## 遊び方
 - 4レーン、各高さ6。カップサイズ1〜5。
 - 1タップ目で移動元レーン（空は不可）、2タップ目で移動先。 同じレーンを2回でスキップ。
